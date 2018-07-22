@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kylelemons/godebug/pretty"
 	"github.com/samsarahq/thunder/graphql"
 	"github.com/samsarahq/thunder/internal"
 	"github.com/stretchr/testify/assert"
@@ -581,5 +582,208 @@ func TestBadArguments(t *testing.T) {
 
 	if _, err := schema.Build(); err.Error() != "bad method aField on type schemabuilder.query: attempted to parse int64 as arguments struct, but failed: expected struct but received type int64" {
 		t.Errorf("expected non-struct args argument to fail, but received %s", err.Error())
+	}
+}
+
+type GatewayType int
+
+const (
+	GatewayType_Vehicle GatewayType = iota
+	GatewayType_Asset
+)
+
+func TestUnionType(t *testing.T) {
+	type Vehicle struct {
+		Name  string
+		Speed int64
+	}
+	type Asset struct {
+		Name         string
+		BatteryLevel int64
+	}
+
+	type Gateway struct {
+		Union
+
+		*Vehicle
+		*Asset
+	}
+
+	schema := NewSchema()
+	query := schema.Query()
+	schema.Enum(GatewayType(0), map[string]GatewayType{
+		"vehicle": 0,
+		"asset":   1,
+	})
+
+	query.FieldFunc("gateway", func(args struct{ Type GatewayType }) (*Gateway, error) {
+		if args.Type == GatewayType_Vehicle {
+			return &Gateway{
+				Vehicle: &Vehicle{Name: "a", Speed: 50},
+			}, nil
+		}
+
+		return &Gateway{
+			Asset: &Asset{Name: "b", BatteryLevel: 5},
+		}, nil
+	})
+
+	builtSchema := schema.MustBuild()
+
+	ctx := context.Background()
+
+	q := graphql.MustParse(`
+		{
+			asset: gateway(type: "asset") { __typename ... on Asset { name batteryLevel } ... on Vehicle { name speed } }
+			vehicle: gateway(type: "vehicle") { ... on Asset { name batteryLevel } ... on Vehicle { name speed } }
+		}
+	`, map[string]interface{}{"var": float64(3)})
+
+	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+		t.Error(err)
+	}
+
+	e := graphql.Executor{}
+
+	result, err := e.Execute(ctx, builtSchema.Query, nil, q)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if d := pretty.Compare(internal.AsJSON(result), internal.ParseJSON(`
+		{"vehicle": { "name": "a", "speed": 50 }, "asset": { "name": "b", "batteryLevel": 5, "__typename": "Gateway" }}`)); d != "" {
+		t.Errorf("expected did not match result: %s", d)
+	}
+}
+
+type UnionPart1 struct{ OtherThing string }
+type UnionPart2 struct{ Thing string }
+
+type UnionMarkerPtrType struct {
+	*Union
+
+	*UnionPart1
+	*UnionPart2
+}
+
+func TestBadUnionMarkerPtr(t *testing.T) {
+	schema := NewSchema()
+	query := schema.Query()
+	query.FieldFunc("union", func() (*UnionMarkerPtrType, error) {
+		return nil, nil
+	})
+
+	_, err := schema.Build()
+	if err == nil {
+		t.Fatalf("expected error, received nil")
+	}
+	if !strings.Contains(err.Error(), "schemabuilder.Union can only be used as an embedded anonymous non-pointer struct") {
+		t.Errorf("expected error, received %s", err.Error())
+	}
+}
+
+type UnionWithNonAnonymousPtrType struct {
+	Something *Union
+
+	*UnionPart1
+	*UnionPart2
+}
+
+func TestBadUnionNonAnonymousPtr(t *testing.T) {
+	schema := NewSchema()
+	query := schema.Query()
+	query.FieldFunc("union", func() (*UnionWithNonAnonymousPtrType, error) {
+		return nil, nil
+	})
+
+	_, err := schema.Build()
+	if err == nil {
+		t.Fatalf("expected error, received nil")
+	}
+
+	if !strings.Contains(err.Error(), "schemabuilder.Union can only be used as an embedded anonymous non-pointer struct") {
+		t.Errorf("expected error, received %s", err.Error())
+	}
+}
+
+type UnionNonAnonymousMembersType struct {
+	Union
+
+	A *UnionPart1
+	B *UnionPart2
+}
+
+func TestBadUnionNonAnonymousMembers(t *testing.T) {
+	schema := NewSchema()
+	query := schema.Query()
+	query.FieldFunc("union", func() (*UnionNonAnonymousMembersType, error) {
+		return nil, nil
+	})
+
+	_, err := schema.Build()
+	if err == nil {
+		t.Fatalf("expected error, received nil")
+	}
+
+	if !strings.Contains(err.Error(), "union type member types must be anonymous") {
+		t.Errorf("expected error, received %s", err.Error())
+	}
+}
+
+func TestNonPointerOneHot(t *testing.T) {
+	type UnionType struct {
+		Union
+
+		UnionPart1
+		UnionPart2
+	}
+
+	schema := NewSchema()
+	query := schema.Query()
+	query.FieldFunc("union", func() (*UnionType, error) {
+		return nil, nil
+	})
+
+	_, err := schema.Build()
+	if err == nil {
+		t.Fatalf("expected error, received nil")
+	}
+
+	if !strings.Contains(err.Error(), "union type member must be a pointer to a struct") {
+		t.Errorf("expected error, received %s", err.Error())
+	}
+}
+
+func TestBadUnionNonOneHot(t *testing.T) {
+	type UnionType struct {
+		Union
+
+		*UnionPart1
+		*UnionPart2
+	}
+
+	schema := NewSchema()
+	query := schema.Query()
+	query.FieldFunc("union", func() (*UnionType, error) {
+		return &UnionType{UnionPart1: &UnionPart1{}, UnionPart2: &UnionPart2{}}, nil
+	})
+
+	builtSchema := schema.MustBuild()
+	ctx := context.Background()
+
+	q := graphql.MustParse(`{ union { __typename } }`, map[string]interface{}{"var": float64(3)})
+
+	if err := graphql.PrepareQuery(builtSchema.Query, q.SelectionSet); err != nil {
+		t.Error(err)
+	}
+
+	e := graphql.Executor{}
+	_, err := e.Execute(ctx, builtSchema.Query, nil, q)
+	if err == nil {
+		t.Error("expected err, received nil")
+	}
+
+	if !strings.Contains(err.Error(), "union type field should only return one value") {
+		t.Errorf("expected err, received %s", err.Error())
 	}
 }
